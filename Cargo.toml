@@ -1,0 +1,49 @@
+[package]
+name = "chess-rtx"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "A real-time, hardware ray-traced chess game"
+license = "MIT OR Apache-2.0"
+build = "build.rs"
+
+[dependencies]
+anyhow = "1.0"
+ash = "0.38"
+bytemuck = { version = "1.23", features = ["derive"] }
+chess = "3.2"
+clap = { version = "4.5", features = ["derive"] }
+eframe = { version = "0.33.2", default-features = false, features = ["default_fonts", "wayland", "wgpu", "x11"] }
+egui-wgpu = { version = "0.33.2", default-features = false, features = ["wayland", "winit", "x11"] }
+env_logger = "0.11"
+glam = { version = "0.30", features = ["bytemuck"] }
+gltf = "1.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
+log = "0.4"
+meshopt = "0.6.2"
+wgpu = { version = "27.0.1", default-features = false, features = ["vulkan", "wgsl"] }
+
+[build-dependencies]
+anyhow = "1.0"
+shaderc = "0.10"
+
+[dev-dependencies]
+tempfile = "3.22"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+too_many_lines = "allow"
+too_many_arguments = "allow"
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+struct_excessive_bools = "allow"

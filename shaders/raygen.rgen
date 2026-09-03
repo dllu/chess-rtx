@@ -1,0 +1,96 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT sceneTlas;
+layout(set = 0, binding = 1, rgba8) uniform image2D outputImage;
+
+layout(std140, set = 0, binding = 2) uniform FrameUniform {
+    vec4 cameraPosition;
+    vec4 cameraForward;
+    vec4 cameraRight;
+    vec4 cameraUp;
+    vec4 lightPosition;
+    vec4 render;
+    vec4 effects;
+    vec4 resolution;
+} frame;
+
+struct RayPayload {
+    vec3 color;
+    uint depth;
+    uint seed;
+};
+
+layout(location = 0) rayPayloadEXT RayPayload payload;
+
+uint hash(uint value) {
+    value ^= value >> 16;
+    value *= 0x7feb352du;
+    value ^= value >> 15;
+    value *= 0x846ca68bu;
+    value ^= value >> 16;
+    return value;
+}
+
+float random(inout uint state) {
+    state = hash(state + 0x9e3779b9u);
+    return float(state & 0x00ffffffu) / float(0x01000000u);
+}
+
+vec3 acesToneMap(vec3 color) {
+    const float a = 2.51;
+    const float b = 0.03;
+    const float c = 2.43;
+    const float d = 0.59;
+    const float e = 0.14;
+    return clamp((color * (a * color + b)) / (color * (c * color + d) + e), 0.0, 1.0);
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
+    vec2 extent = vec2(gl_LaunchSizeEXT.xy);
+    uint sampleCount = clamp(uint(frame.render.z + 0.5), 1u, 16u);
+    vec3 accumulated = vec3(0.0);
+    uint seed = hash(gl_LaunchIDEXT.x + gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x +
+                     uint(frame.resolution.z) * 0x68bc21ebu);
+
+    for (uint sampleIndex = 0u; sampleIndex < 16u; ++sampleIndex) {
+        if (sampleIndex >= sampleCount) {
+            break;
+        }
+        vec2 jitter = vec2(random(seed), random(seed)) - 0.5;
+        vec2 uv = (vec2(pixel) + vec2(0.5) + jitter) / extent;
+        vec2 ndc = uv * 2.0 - 1.0;
+        ndc.y = -ndc.y;
+        float aspect = extent.x / extent.y;
+        float tanHalfFov = tan(radians(42.0) * 0.5);
+        vec3 direction = normalize(
+            frame.cameraForward.xyz +
+            frame.cameraRight.xyz * (ndc.x * aspect * tanHalfFov) +
+            frame.cameraUp.xyz * (ndc.y * tanHalfFov));
+
+        payload.color = vec3(0.0);
+        payload.depth = 0u;
+        payload.seed = seed;
+        traceRayEXT(
+            sceneTlas,
+            gl_RayFlagsOpaqueEXT,
+            0xff,
+            0,
+            0,
+            0,
+            frame.cameraPosition.xyz,
+            0.002,
+            direction,
+            1000.0,
+            0);
+        accumulated += payload.color;
+        seed = payload.seed;
+    }
+
+    vec3 color = accumulated / float(sampleCount);
+    color *= frame.render.x;
+    color = acesToneMap(color);
+    color = pow(color, vec3(1.0 / 2.2));
+    imageStore(outputImage, pixel, vec4(color, 1.0));
+}
