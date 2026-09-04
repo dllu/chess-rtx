@@ -152,7 +152,7 @@ impl VulkanContext {
             p_queue_priorities: queue_priority.as_ptr(),
             ..Default::default()
         };
-        let extension_names: Vec<*const i8> = required_extensions
+        let extension_names: Vec<_> = required_extensions
             .iter()
             .map(|extension| extension.as_ptr())
             .collect();

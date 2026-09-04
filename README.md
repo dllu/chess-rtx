@@ -8,11 +8,11 @@ Chess RTX is a playable chess presentation built in Rust. The image is generated
 Vulkan ray-tracing pipeline (`VK_KHR_ray_tracing_pipeline`); `wgpu` presents the image and `egui`
 provides the game and material controls.
 
-The renderer prefers Jeyhun1985's high-detail, CC BY 4.0 Staunton meshes from Sketchfab and retains
-the procedural pieces as an automatic fallback when the downloaded assets are not installed. Piece
-and board shaders support ceramic, anisotropic metal, and frosted dielectric materials, with
-recursive reflections, refraction, soft ray-traced shadows, and a caustic contribution for
-transmissive pieces.
+The renderer uses the bundled high-detail, CC BY 4.0 Staunton meshes by Jeyhun1985 from Sketchfab
+and retains procedural pieces as an automatic fallback if those assets are unavailable. Piece and
+board shaders support ceramic, anisotropic metal, and frosted dielectric materials, with recursive
+reflections, refraction, soft ray-traced shadows, and a caustic contribution for transmissive
+pieces.
 
 ## Requirements
 
@@ -22,20 +22,13 @@ transmissive pieces.
 - A Vulkan ray-tracing GPU and current driver (the project defaults to the high-performance GPU)
 - CMake and a C++ compiler for the bundled shader compiler on the first build
 
-## High-detail Staunton assets
+## Bundled Staunton assets
 
-Sketchfab requires an authenticated account for its official model-download API. Copy your private
-API token from [Sketchfab settings](https://sketchfab.com/settings/password), then run:
+The repository includes all six optimized meshes in `assets/staunton/`; no separate download or
+Sketchfab account is required. Set `CHESS_RTX_ASSET_DIR` only if you want to use a different mesh
+directory.
 
-```bash
-./scripts/fetch-staunton-assets.sh
-```
-
-The script prompts for the token without storing it, verifies that all six models are downloadable
-under CC BY, downloads each glTF to a temporary directory, and writes optimized `.mesh` files to
-`assets/staunton/`. The app discovers those files automatically on its next launch. Set
-`CHESS_RTX_ASSET_DIR` to use a different mesh directory.
-
+The mesh adaptations remain licensed under CC BY 4.0 rather than the project's software license.
 See [asset attribution](assets/staunton/ATTRIBUTION.md) for the artist, individual source links,
 license, and a description of the geometry adaptations.
 

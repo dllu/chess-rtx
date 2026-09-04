@@ -1,8 +1,10 @@
 # Staunton chess-piece assets
 
-The optional high-detail piece geometry is by
+The bundled high-detail piece geometry is by
 [Jeyhun1985](https://sketchfab.com/Jeyhun1985) and is licensed under
 [Creative Commons Attribution 4.0 International](https://creativecommons.org/licenses/by/4.0/).
+The `.mesh` adaptations in this directory remain under that license and are not covered by the
+project's software license.
 
 | Piece | Source |
 | --- | --- |
