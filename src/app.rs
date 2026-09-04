@@ -4,13 +4,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chess::{Board, Color, File, Piece, Rank, Square};
+use chess::{Board, File, Rank, Square};
 use eframe::egui::{
-    self, Align2, Color32, FontId, Rect, RichText, Sense, Stroke, TextureHandle, TextureOptions,
-    Vec2,
+    self, Color32, Rect, RichText, Sense, Stroke, TextureHandle, TextureOptions, Vec2,
 };
 
 use crate::{
+    board_pieces,
     chess_game::{ChessGame, ClickResult},
     material::{BoardStyle, GpuMaterial, PieceStyle, RenderSettings},
     rt::RayTracer,
@@ -64,6 +64,7 @@ impl ChessRtxApp {
         height: u32,
         settings: RenderSettings,
     ) -> Self {
+        egui_extras::install_image_loaders(&creation_context.egui_ctx);
         configure_style(&creation_context.egui_ctx);
         let mut app = Self {
             game: ChessGame::new(board),
@@ -611,24 +612,10 @@ impl ChessRtxApp {
                     self.game.board().piece_on(square),
                     self.game.board().color_on(square),
                 ) {
-                    let disk = if color == Color::White {
-                        Color32::from_rgb(226, 220, 201)
-                    } else {
-                        Color32::from_rgb(24, 29, 38)
-                    };
-                    let text_color = if color == Color::White {
-                        Color32::from_rgb(37, 42, 48)
-                    } else {
-                        Color32::from_rgb(226, 220, 201)
-                    };
-                    painter.circle_filled(square_rect.center(), cell * 0.34, disk);
-                    painter.text(
-                        square_rect.center(),
-                        Align2::CENTER_CENTER,
-                        piece_letter(piece),
-                        FontId::proportional(cell * 0.48),
-                        text_color,
-                    );
+                    egui::Image::new(board_pieces::image_source(piece, color))
+                        .texture_options(TextureOptions::LINEAR)
+                        .show_loading_spinner(false)
+                        .paint_at(ui, square_rect.shrink(cell * 0.025));
                 }
             }
         }
@@ -799,6 +786,28 @@ fn piece_asset_credits(ui: &mut egui::Ui) {
             "Creative Commons Attribution 4.0",
             "https://creativecommons.org/licenses/by/4.0/",
         );
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+        ui.label("2D chess-piece artwork by Cburnett, from Wikimedia Commons:");
+        ui.hyperlink_to(
+            "Standard transparent chess-piece set",
+            "https://commons.wikimedia.org/wiki/Category:SVG_chess_pieces/Standard_transparent",
+        );
+        ui.hyperlink_to(
+            "BSD 3-Clause license",
+            "https://opensource.org/license/bsd-3-clause",
+        );
+        ui.collapsing("BSD 3-Clause notice", |ui| {
+            ui.label(
+                RichText::new(include_str!(
+                    "../assets/chess-pieces-2d/LICENSE"
+                ))
+                .small()
+                .monospace(),
+            );
+        });
     });
 }
 
@@ -845,17 +854,6 @@ fn piece_material_controls(
         .add(egui::Slider::new(&mut material.optics[1], 0.0..=2.0).text("Caustics"))
         .changed();
     changed
-}
-
-const fn piece_letter(piece: Piece) -> &'static str {
-    match piece {
-        Piece::Pawn => "P",
-        Piece::Knight => "N",
-        Piece::Bishop => "B",
-        Piece::Rook => "R",
-        Piece::Queen => "Q",
-        Piece::King => "K",
-    }
 }
 
 fn configure_style(context: &egui::Context) {

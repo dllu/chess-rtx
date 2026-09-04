@@ -14,6 +14,7 @@ bytemuck = { version = "1.23", features = ["derive"] }
 chess = "3.2"
 clap = { version = "4.5", features = ["derive"] }
 eframe = { version = "0.33.2", default-features = false, features = ["default_fonts", "wayland", "wgpu", "x11"] }
+egui_extras = { version = "0.33.2", default-features = false, features = ["svg"] }
 egui-wgpu = { version = "0.33.2", default-features = false, features = ["wayland", "winit", "x11"] }
 env_logger = "0.11"
 glam = { version = "0.30", features = ["bytemuck"] }

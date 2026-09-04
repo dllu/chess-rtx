@@ -39,6 +39,14 @@ under CC BY, downloads each glTF to a temporary directory, and writes optimized 
 See [asset attribution](assets/staunton/ATTRIBUTION.md) for the artist, individual source links,
 license, and a description of the geometry adaptations.
 
+## 2D board artwork
+
+The interactive chess diagram uses Cburnett's standard 45×45 SVG chess-piece set from Wikimedia
+Commons. The vectors are rasterized at the display's native pixel size so they stay sharp on HiDPI
+screens. They are distributed under the BSD 3-Clause option offered by the original author; see
+[2D artwork attribution](assets/chess-pieces-2d/ATTRIBUTION.md) for sources, modifications, and the
+full license notice.
+
 ## Run
 
 ```bash
@@ -83,6 +91,7 @@ Run the CPU-side tests with `cargo test`.
 
 - `src/rt.rs`: Vulkan device, BLAS/TLAS, shader binding table, ray dispatch, and readback
 - `src/assets.rs`: glTF import, mesh simplification, native asset format, and runtime asset loading
+- `src/board_pieces.rs`: embedded, resolution-independent artwork for the interactive 2D board
 - `src/scene.rs`: licensed-piece integration, procedural fallback meshes, and board scene
 - `src/material.rs`: editable GPU material and camera settings
 - `src/chess_game.rs`: legal move interaction backed by the `chess` move generator
