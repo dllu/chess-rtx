@@ -1,6 +1,8 @@
 use std::{
+    collections::VecDeque,
     fs,
     path::PathBuf,
+    sync::mpsc::TryRecvError,
     time::{Duration, Instant},
 };
 
@@ -13,8 +15,7 @@ use crate::{
     board_pieces,
     chess_game::{ChessGame, ClickResult},
     material::{BoardStyle, GpuMaterial, PieceStyle, RenderSettings},
-    rt::RayTracer,
-    scene::ChessScene,
+    render_worker::{RenderEvent, RenderFailureStage, RenderRequest, RenderWorker, RenderedFrame},
 };
 
 const DEFAULT_ACCUMULATION_PASS_LIMIT: u32 = 4_096;
@@ -22,6 +23,16 @@ const MAX_ACCUMULATION_PASS_LIMIT: u32 = 65_536;
 const VIEWPORT_RESIZE_SETTLE_TIME: Duration = Duration::from_millis(120);
 const MIN_INTERACTIVE_RENDER_DIMENSION: u32 = 64;
 const MAX_INTERACTIVE_RENDER_DIMENSION: u32 = 8_192;
+const MIN_SAMPLES_PER_PASS: u32 = 1;
+const MAX_SAMPLES_PER_PASS: u32 = 16;
+const FAST_PASS_THRESHOLD: f32 = 0.7;
+const SLOW_PASS_THRESHOLD: f32 = 1.1;
+const FAST_PASSES_BEFORE_INCREASE: u8 = 2;
+const DEFAULT_REFRESH_RATE_HZ: f32 = 60.0;
+const MIN_REFRESH_RATE_HZ: f32 = 20.0;
+const MAX_REFRESH_RATE_HZ: f32 = 500.0;
+const REFRESH_TIMING_SAMPLE_COUNT: usize = 31;
+const REFRESH_TIMING_WARMUP_SAMPLES: usize = 8;
 
 #[derive(Clone, Copy)]
 struct PendingViewportResize {
@@ -29,22 +40,147 @@ struct PendingViewportResize {
     stable_since: Instant,
 }
 
+struct RefreshRateEstimator {
+    frame_intervals: VecDeque<f32>,
+    hertz: f32,
+    calibrated: bool,
+}
+
+impl RefreshRateEstimator {
+    fn new() -> Self {
+        Self {
+            frame_intervals: VecDeque::with_capacity(REFRESH_TIMING_SAMPLE_COUNT),
+            hertz: DEFAULT_REFRESH_RATE_HZ,
+            calibrated: false,
+        }
+    }
+
+    fn observe(&mut self, seconds: f32) {
+        let maximum_interval = 1.0 / MIN_REFRESH_RATE_HZ;
+        if !seconds.is_finite() || seconds <= 0.0 || seconds > maximum_interval {
+            return;
+        }
+        if self.frame_intervals.len() == REFRESH_TIMING_SAMPLE_COUNT {
+            self.frame_intervals.pop_front();
+        }
+        self.frame_intervals.push_back(seconds);
+        if self.frame_intervals.len() < REFRESH_TIMING_WARMUP_SAMPLES {
+            return;
+        }
+
+        let mut sorted = self.frame_intervals.iter().copied().collect::<Vec<_>>();
+        sorted.sort_by(f32::total_cmp);
+        let interval = sorted[sorted.len() / 2];
+        let measured_hertz = (1.0 / interval).clamp(MIN_REFRESH_RATE_HZ, MAX_REFRESH_RATE_HZ);
+        if self.calibrated {
+            // A busy GPU can make the UI miss vblanks. Never mistake that slowdown for a lower
+            // monitor refresh rate and consequently give ray tracing an even larger budget.
+            self.hertz = self.hertz.max(measured_hertz);
+        } else {
+            self.hertz = measured_hertz;
+            self.calibrated = true;
+        }
+    }
+
+    fn restart(&mut self) {
+        self.frame_intervals.clear();
+        self.hertz = DEFAULT_REFRESH_RATE_HZ;
+        self.calibrated = false;
+    }
+
+    const fn is_calibrated(&self) -> bool {
+        self.calibrated
+    }
+
+    fn frame_budget_milliseconds(&self) -> f32 {
+        1_000.0 / self.hertz
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AdaptiveSampler {
+    samples: u32,
+    smoothed_milliseconds: Option<f32>,
+    consecutive_fast_passes: u8,
+}
+
+impl AdaptiveSampler {
+    const fn new() -> Self {
+        Self {
+            samples: MIN_SAMPLES_PER_PASS,
+            smoothed_milliseconds: None,
+            consecutive_fast_passes: 0,
+        }
+    }
+
+    fn restart(&mut self) {
+        *self = Self::new();
+    }
+
+    fn observe(&mut self, samples: u32, milliseconds: f32, target_milliseconds: f32) {
+        if samples != self.samples
+            || !milliseconds.is_finite()
+            || milliseconds <= 0.0
+            || !target_milliseconds.is_finite()
+            || target_milliseconds <= 0.0
+        {
+            return;
+        }
+        let smoothed = self.smoothed_milliseconds.map_or(milliseconds, |previous| {
+            previous * 0.75 + milliseconds * 0.25
+        });
+        self.smoothed_milliseconds = Some(smoothed);
+
+        if smoothed > target_milliseconds * SLOW_PASS_THRESHOLD
+            && self.samples > MIN_SAMPLES_PER_PASS
+        {
+            let proportional = ((self.samples as f32 * target_milliseconds / smoothed).floor()
+                as u32)
+                .clamp(MIN_SAMPLES_PER_PASS, self.samples - 1);
+            self.samples = proportional;
+            self.smoothed_milliseconds = None;
+            self.consecutive_fast_passes = 0;
+        } else if smoothed < target_milliseconds * FAST_PASS_THRESHOLD
+            && self.samples < MAX_SAMPLES_PER_PASS
+        {
+            self.consecutive_fast_passes = self.consecutive_fast_passes.saturating_add(1);
+            if self.consecutive_fast_passes >= FAST_PASSES_BEFORE_INCREASE {
+                let proportional = ((self.samples as f32 * target_milliseconds / smoothed).floor()
+                    as u32)
+                    .clamp(self.samples + 1, MAX_SAMPLES_PER_PASS);
+                self.samples = proportional.min(self.samples.saturating_mul(2));
+                self.smoothed_milliseconds = None;
+                self.consecutive_fast_passes = 0;
+            }
+        } else {
+            self.consecutive_fast_passes = 0;
+        }
+    }
+}
+
 pub struct ChessRtxApp {
     game: ChessGame,
-    renderer: Option<RayTracer>,
+    render_worker: Option<RenderWorker>,
     texture: Option<TextureHandle>,
     pixels: Vec<u8>,
-    accumulation: Vec<u64>,
     accumulation_passes: u64,
+    accumulated_samples_per_pixel: u64,
     accumulation_pass_limit: u32,
     continuous_accumulation: bool,
     accumulation_paused: bool,
+    adaptive_sampling: bool,
+    adaptive_sampler: AdaptiveSampler,
+    refresh_rate: RefreshRateEstimator,
     settings: RenderSettings,
     width: u32,
     height: u32,
+    target_dimensions: [u32; 2],
     pending_viewport_resize: Option<PendingViewportResize>,
     failed_viewport_resize: Option<[u32; 2]>,
     render_requested: bool,
+    render_in_flight: bool,
+    render_generation: u64,
+    scene_revision: u64,
     scene_rebuild_requested: bool,
     piece_geometry: &'static str,
     status: String,
@@ -66,117 +202,254 @@ impl ChessRtxApp {
     ) -> Self {
         egui_extras::install_image_loaders(&creation_context.egui_ctx);
         configure_style(&creation_context.egui_ctx);
-        let mut app = Self {
+        let (render_worker, worker_error) =
+            match RenderWorker::spawn(creation_context.egui_ctx.clone()) {
+                Ok(worker) => (Some(worker), None),
+                Err(error) => (
+                    None,
+                    Some(format!("could not start the RTX render worker: {error}")),
+                ),
+            };
+        Self {
             game: ChessGame::new(board),
-            renderer: None,
+            render_worker,
             texture: None,
             pixels: Vec::new(),
-            accumulation: Vec::new(),
             accumulation_passes: 0,
+            accumulated_samples_per_pixel: 0,
             accumulation_pass_limit: DEFAULT_ACCUMULATION_PASS_LIMIT,
             continuous_accumulation: false,
             accumulation_paused: false,
+            adaptive_sampling: true,
+            adaptive_sampler: AdaptiveSampler::new(),
+            refresh_rate: RefreshRateEstimator::new(),
             settings,
             width,
             height,
+            target_dimensions: [width, height],
             pending_viewport_resize: None,
             failed_viewport_resize: None,
-            render_requested: true,
+            render_requested: worker_error.is_none(),
+            render_in_flight: false,
+            render_generation: 0,
+            scene_revision: 0,
             scene_rebuild_requested: true,
             piece_geometry: "loading piece geometry",
-            status: "Initializing RTX pipeline…".to_owned(),
-            error: None,
+            status: if worker_error.is_none() {
+                "Initializing RTX pipeline…".to_owned()
+            } else {
+                "RTX render worker failed".to_owned()
+            },
+            error: worker_error,
             fen_input: board.to_string(),
             fen_error: None,
             last_render_ms: 0.0,
             save_counter: 0,
-        };
-        app.render_if_needed(&creation_context.egui_ctx);
-        app
+        }
     }
 
-    fn rebuild_renderer(&mut self) {
-        self.renderer = None;
-        self.accumulation_paused = false;
-        self.reset_accumulation();
-        let scene = ChessScene::from_board(self.game.board());
-        let geometry = scene.geometry_label();
-        self.piece_geometry = geometry;
-        match RayTracer::new(self.width, self.height, &scene) {
-            Ok(renderer) => {
-                self.status = format!("RTX ready · {geometry} · {}", renderer.device_name());
-                self.renderer = Some(renderer);
-                self.error = None;
-                self.render_requested = true;
-            }
-            Err(error) => {
-                self.error = Some(format!("{error:#}"));
-                "RTX initialization failed".clone_into(&mut self.status);
-            }
+    fn prepare_scene_rebuild(&mut self) {
+        if !self.scene_rebuild_requested {
+            return;
         }
+        if self.render_worker.is_none() {
+            self.scene_rebuild_requested = false;
+            return;
+        }
+        self.scene_revision = self.scene_revision.wrapping_add(1);
         self.scene_rebuild_requested = false;
+        self.accumulation_paused = false;
+        self.piece_geometry = "loading piece geometry";
+        "Building RTX acceleration structures…".clone_into(&mut self.status);
+        self.error = None;
+        self.reset_accumulation();
     }
 
     fn render_if_needed(&mut self, context: &egui::Context) {
-        if self.scene_rebuild_requested {
-            self.rebuild_renderer();
+        if self.render_requested || self.render_in_flight {
+            let frame_interval = context.input(|input| input.unstable_dt);
+            self.refresh_rate.observe(frame_interval);
         }
-        if !self.render_requested || self.accumulation_paused {
+        self.prepare_scene_rebuild();
+        self.receive_render_events(context);
+        self.update_render_schedule(context);
+        self.dispatch_render(context);
+        if self.render_in_flight {
+            // Keep the lightweight egui/wgpu loop running at vsync while Vulkan works elsewhere.
+            context.request_repaint();
+        }
+    }
+
+    fn dispatch_render(&mut self, context: &egui::Context) {
+        if !self.render_requested || self.render_in_flight {
             return;
         }
-        let Some(renderer) = self.renderer.as_mut() else {
+        if self.adaptive_sampling && !self.refresh_rate.is_calibrated() {
+            context.request_repaint();
+            return;
+        }
+        let pass_samples = if self.adaptive_sampling {
+            self.adaptive_sampler.samples
+        } else {
+            self.settings
+                .samples
+                .clamp(MIN_SAMPLES_PER_PASS, MAX_SAMPLES_PER_PASS)
+        };
+        let mut pass_settings = self.settings.clone();
+        pass_settings.samples = pass_samples;
+        let request = RenderRequest {
+            generation: self.render_generation,
+            scene_revision: self.scene_revision,
+            board: *self.game.board(),
+            dimensions: self.target_dimensions,
+            settings: pass_settings,
+        };
+        let Some(worker) = self.render_worker.as_ref() else {
             return;
         };
-        let started = Instant::now();
-        match renderer.render(&self.settings) {
-            Ok(pass_pixels) => {
-                self.last_render_ms = started.elapsed().as_secs_f32() * 1000.0;
-                if self.accumulation.len() != pass_pixels.len() {
-                    self.accumulation = vec![0; pass_pixels.len()];
-                    self.accumulation_passes = 0;
-                }
-                for (sum, sample) in self.accumulation.iter_mut().zip(&pass_pixels) {
-                    *sum = sum.saturating_add(u64::from(*sample));
-                }
-                self.accumulation_passes = self.accumulation_passes.saturating_add(1);
-                self.pixels.resize(pass_pixels.len(), 0);
-                for (pixel, sum) in self.pixels.iter_mut().zip(&self.accumulation) {
-                    *pixel = (sum / self.accumulation_passes) as u8;
-                }
-                let image =
-                    egui::ColorImage::from_rgba_unmultiplied(renderer.dimensions(), &self.pixels);
-                if let Some(texture) = self.texture.as_mut() {
-                    texture.set(image, TextureOptions::LINEAR);
-                } else {
-                    self.texture = Some(context.load_texture(
-                        "chess-rtx-output",
-                        image,
-                        TextureOptions::LINEAR,
-                    ));
-                }
-                self.error = None;
-                let target = if self.continuous_accumulation {
-                    "∞".to_owned()
-                } else {
-                    self.accumulation_pass_limit.to_string()
+        worker.submit(request);
+        self.render_in_flight = true;
+        context.request_repaint();
+    }
+
+    fn receive_render_events(&mut self, context: &egui::Context) {
+        loop {
+            let event = {
+                let Some(worker) = self.render_worker.as_ref() else {
+                    return;
                 };
-                self.status = format!(
-                    "{} rays/pixel · pass {}/{} · {:.1} ms/pass · {} · {}",
-                    u64::from(self.settings.samples).saturating_mul(self.accumulation_passes),
-                    self.accumulation_passes,
-                    target,
-                    self.last_render_ms,
-                    self.piece_geometry,
-                    renderer.device_name()
-                );
-                context.request_repaint();
-            }
-            Err(error) => {
-                self.error = Some(format!("{error:#}"));
-                "Ray dispatch failed".clone_into(&mut self.status);
+                worker.try_recv()
+            };
+            match event {
+                Ok(RenderEvent::Frame(frame)) => self.accept_rendered_frame(context, frame),
+                Ok(RenderEvent::Failed {
+                    generation,
+                    stage,
+                    message,
+                }) => self.accept_render_failure(generation, stage, message),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.render_worker = None;
+                    self.render_in_flight = false;
+                    self.render_requested = false;
+                    self.error = Some("the RTX render worker stopped unexpectedly".to_owned());
+                    "RTX render worker stopped".clone_into(&mut self.status);
+                    break;
+                }
             }
         }
-        self.update_render_schedule(context);
+    }
+
+    fn accept_rendered_frame(&mut self, context: &egui::Context, frame: RenderedFrame) {
+        if frame.generation != self.render_generation {
+            self.accept_interactive_preview(context, frame);
+            return;
+        }
+        self.render_in_flight = false;
+        self.width = frame.dimensions[0] as u32;
+        self.height = frame.dimensions[1] as u32;
+        self.target_dimensions = [self.width, self.height];
+        self.accumulation_passes = self.accumulation_passes.saturating_add(1);
+        self.accumulated_samples_per_pixel = frame.accumulated_samples_per_pixel;
+        self.last_render_ms = frame.elapsed_milliseconds;
+        self.piece_geometry = frame.geometry_label;
+
+        self.update_render_texture(context, frame.dimensions, frame.pixels);
+        if self.adaptive_sampling {
+            self.adaptive_sampler.observe(
+                frame.samples_per_pixel,
+                self.last_render_ms,
+                self.refresh_rate.frame_budget_milliseconds(),
+            );
+        }
+        self.error = None;
+        let target = if self.continuous_accumulation {
+            "∞".to_owned()
+        } else {
+            self.accumulation_pass_limit.to_string()
+        };
+        let sampling = if self.adaptive_sampling {
+            format!("auto {} spp next", self.adaptive_sampler.samples)
+        } else {
+            format!("{} spp", frame.samples_per_pixel)
+        };
+        self.status = format!(
+            "{} rays/pixel · {sampling} · pass {}/{} · {:.1} ms/pass · {:.0} Hz · {} · {}",
+            self.accumulated_samples_per_pixel,
+            self.accumulation_passes,
+            target,
+            self.last_render_ms,
+            self.refresh_rate.hertz,
+            self.piece_geometry,
+            frame.device_name
+        );
+        context.request_repaint();
+    }
+
+    fn accept_interactive_preview(&mut self, context: &egui::Context, frame: RenderedFrame) {
+        if frame.scene_revision != self.scene_revision
+            || frame.dimensions != [self.width as usize, self.height as usize]
+        {
+            return;
+        }
+        self.last_render_ms = frame.elapsed_milliseconds;
+        self.piece_geometry = frame.geometry_label;
+        let samples_per_pixel = frame.samples_per_pixel;
+        let device_name = frame.device_name;
+        self.update_render_texture(context, frame.dimensions, frame.pixels);
+        self.status = format!(
+            "Interactive preview · {samples_per_pixel} ray/pixel · {:.1} ms/pass · {:.0} Hz · {} · {device_name}",
+            self.last_render_ms, self.refresh_rate.hertz, self.piece_geometry
+        );
+        context.request_repaint();
+    }
+
+    fn update_render_texture(
+        &mut self,
+        context: &egui::Context,
+        dimensions: [usize; 2],
+        pixels: Vec<u8>,
+    ) {
+        self.pixels = pixels;
+        let image = egui::ColorImage::from_rgba_unmultiplied(dimensions, &self.pixels);
+        if let Some(texture) = self.texture.as_mut() {
+            texture.set(image, TextureOptions::LINEAR);
+        } else {
+            self.texture =
+                Some(context.load_texture("chess-rtx-output", image, TextureOptions::LINEAR));
+        }
+    }
+
+    fn accept_render_failure(
+        &mut self,
+        generation: u64,
+        stage: RenderFailureStage,
+        message: String,
+    ) {
+        if generation != self.render_generation {
+            return;
+        }
+        self.render_in_flight = false;
+        if stage == RenderFailureStage::Resize {
+            let failed_dimensions = self.target_dimensions;
+            self.failed_viewport_resize = Some(failed_dimensions);
+            self.target_dimensions = [self.width, self.height];
+            self.status = format!(
+                "Keeping {} × {} viewport; {} × {} resize failed: {message}",
+                self.width, self.height, failed_dimensions[0], failed_dimensions[1]
+            );
+            self.reset_accumulation();
+            return;
+        }
+
+        self.error = Some(message);
+        self.render_requested = false;
+        match stage {
+            RenderFailureStage::Initialization => "RTX initialization failed",
+            RenderFailureStage::Resize => unreachable!("resize failures return above"),
+            RenderFailureStage::Dispatch => "Ray dispatch failed",
+        }
+        .clone_into(&mut self.status);
     }
 
     fn mark_render_changed(&mut self, changed: bool) {
@@ -186,9 +459,19 @@ impl ChessRtxApp {
     }
 
     fn reset_accumulation(&mut self) {
-        self.accumulation.fill(0);
+        if let Some(worker) = self.render_worker.as_ref() {
+            _ = worker.cancel_pending();
+        }
+        self.render_generation = self.render_generation.wrapping_add(1);
+        self.render_in_flight = false;
         self.accumulation_passes = 0;
+        self.accumulated_samples_per_pixel = 0;
+        self.adaptive_sampler.restart();
         self.render_requested = true;
+    }
+
+    const fn accumulated_samples_per_pixel(&self) -> u64 {
+        self.accumulated_samples_per_pixel
     }
 
     fn accumulation_has_budget(&self) -> bool {
@@ -198,19 +481,17 @@ impl ChessRtxApp {
 
     fn update_render_schedule(&mut self, context: &egui::Context) {
         self.render_requested = self.error.is_none()
-            && self.renderer.is_some()
+            && self.render_worker.is_some()
             && !self.accumulation_paused
             && self.accumulation_has_budget();
-        if self.render_requested {
+        if self.render_requested || self.render_in_flight {
             context.request_repaint();
         }
     }
 
     fn track_viewport_size(&mut self, context: &egui::Context, logical_size: Vec2) {
         let dimensions = interactive_render_dimensions(logical_size, context.pixels_per_point());
-        if dimensions == [self.width, self.height]
-            || self.failed_viewport_resize == Some(dimensions)
-        {
+        if dimensions == self.target_dimensions || self.failed_viewport_resize == Some(dimensions) {
             self.pending_viewport_resize = None;
             return;
         }
@@ -236,7 +517,7 @@ impl ChessRtxApp {
 
         let elapsed = now.saturating_duration_since(pending.stable_since);
         if elapsed < VIEWPORT_RESIZE_SETTLE_TIME {
-            context.request_repaint_after(VIEWPORT_RESIZE_SETTLE_TIME - elapsed);
+            context.request_repaint_after(VIEWPORT_RESIZE_SETTLE_TIME.saturating_sub(elapsed));
             return;
         }
         self.pending_viewport_resize = None;
@@ -245,27 +526,11 @@ impl ChessRtxApp {
 
     fn resize_render_target(&mut self, dimensions: [u32; 2]) {
         let [width, height] = dimensions;
-        let Some(renderer) = self.renderer.as_mut() else {
-            return;
-        };
-        match renderer.resize(width, height) {
-            Ok(()) => {
-                self.width = width;
-                self.height = height;
-                self.failed_viewport_resize = None;
-                self.accumulation.clear();
-                self.pixels.clear();
-                self.reset_accumulation();
-                self.status = format!("Resized RTX viewport to {width} × {height}");
-            }
-            Err(error) => {
-                self.failed_viewport_resize = Some(dimensions);
-                self.status = format!(
-                    "Keeping {} × {} viewport; {width} × {height} resize failed: {error:#}",
-                    self.width, self.height
-                );
-            }
-        }
+        self.target_dimensions = dimensions;
+        self.failed_viewport_resize = None;
+        self.refresh_rate.restart();
+        self.reset_accumulation();
+        self.status = format!("Resizing RTX viewport to {width} × {height}…");
     }
 
     fn sync_fen_from_board(&mut self) {
@@ -312,6 +577,7 @@ impl ChessRtxApp {
                         }
                         if ui.button("Render").clicked() {
                             self.accumulation_paused = false;
+                            self.error = None;
                             self.reset_accumulation();
                             self.update_render_schedule(context);
                         }
@@ -323,6 +589,13 @@ impl ChessRtxApp {
                         } else if self.render_requested && ui.button("Pause").clicked() {
                             self.accumulation_paused = true;
                             self.render_requested = false;
+                            if self
+                                .render_worker
+                                .as_ref()
+                                .is_some_and(RenderWorker::cancel_pending)
+                            {
+                                self.render_in_flight = false;
+                            }
                         }
                     });
                 });
@@ -495,12 +768,46 @@ impl ChessRtxApp {
                     changed |= ui
                         .checkbox(&mut self.settings.soft_shadows, "Soft ray-traced shadows")
                         .changed();
-                    changed |= ui
-                        .add(
-                            egui::Slider::new(&mut self.settings.samples, 1..=16)
-                                .text("Rays / pixel"),
+                    let sampling_mode_changed = ui
+                        .checkbox(
+                            &mut self.adaptive_sampling,
+                            "Adaptive rays / pixel (match display)",
                         )
                         .changed();
+                    let samples_changed = if self.adaptive_sampling {
+                        let target_milliseconds = self.refresh_rate.frame_budget_milliseconds();
+                        ui.label(
+                            RichText::new(format!(
+                                "Next pass: {} rays/pixel · {:.0} Hz / {:.1} ms budget",
+                                self.adaptive_sampler.samples,
+                                self.refresh_rate.hertz,
+                                target_milliseconds
+                            ))
+                            .small()
+                            .color(Color32::from_gray(145)),
+                        );
+                        if self.adaptive_sampler.samples == MIN_SAMPLES_PER_PASS
+                            && self.last_render_ms > target_milliseconds * SLOW_PASS_THRESHOLD
+                        {
+                            ui.label(
+                                RichText::new(
+                                    "At the 1 ray/pixel floor; the UI remains independently vsynced.",
+                                )
+                                .small()
+                                .color(Color32::from_rgb(218, 174, 95)),
+                            );
+                        }
+                        false
+                    } else {
+                        ui.add(
+                            egui::Slider::new(
+                                &mut self.settings.samples,
+                                MIN_SAMPLES_PER_PASS..=MAX_SAMPLES_PER_PASS,
+                            )
+                            .text("Rays / pixel"),
+                        )
+                        .changed()
+                    };
                     changed |= ui
                         .add(
                             egui::Slider::new(&mut self.settings.max_bounces, 1..=7)
@@ -519,7 +826,7 @@ impl ChessRtxApp {
                                 .text("Light radius"),
                         )
                         .changed();
-                    self.mark_render_changed(changed);
+                    self.mark_render_changed(changed || sampling_mode_changed || samples_changed);
 
                     ui.add_space(12.0);
                     ui.separator();
@@ -548,19 +855,20 @@ impl ChessRtxApp {
                     if self.continuous_accumulation {
                         ui.label(
                             RichText::new(format!(
-                                "{} passes accumulated; use Pause in the top bar to stop.",
-                                self.accumulation_passes
+                                "{} passes · {} rays/pixel accumulated; use Pause to stop.",
+                                self.accumulation_passes,
+                                self.accumulated_samples_per_pixel()
                             ))
                             .small()
                             .color(Color32::from_gray(145)),
                         );
                     } else {
-                        let target_rays = u64::from(self.settings.samples)
-                            * u64::from(self.accumulation_pass_limit);
                         ui.label(
                             RichText::new(format!(
-                                "{} / {} passes · up to {target_rays} rays/pixel",
-                                self.accumulation_passes, self.accumulation_pass_limit
+                                "{} / {} passes · {} rays/pixel accumulated",
+                                self.accumulation_passes,
+                                self.accumulation_pass_limit,
+                                self.accumulated_samples_per_pixel()
                             ))
                             .small()
                             .color(Color32::from_gray(145)),
@@ -893,5 +1201,79 @@ mod tests {
                 MAX_INTERACTIVE_RENDER_DIMENSION
             ]
         );
+    }
+
+    #[test]
+    fn adaptive_sampler_increases_only_after_sustained_fast_passes() {
+        let mut sampler = AdaptiveSampler::new();
+        sampler.observe(1, 5.0, 1_000.0 / 60.0);
+        assert_eq!(sampler.samples, 1);
+
+        sampler.observe(1, 5.0, 1_000.0 / 60.0);
+        assert_eq!(sampler.samples, 2);
+    }
+
+    #[test]
+    fn adaptive_sampler_immediately_reduces_a_slow_pass() {
+        let mut sampler = AdaptiveSampler::new();
+        sampler.observe(1, 5.0, 1_000.0 / 60.0);
+        sampler.observe(1, 5.0, 1_000.0 / 60.0);
+        assert_eq!(sampler.samples, 2);
+
+        sampler.observe(2, 100.0, 1_000.0 / 60.0);
+        assert_eq!(sampler.samples, 1);
+    }
+
+    #[test]
+    fn adaptive_sampler_restart_prioritizes_latency() {
+        let mut sampler = AdaptiveSampler::new();
+        sampler.observe(1, 5.0, 1_000.0 / 60.0);
+        sampler.observe(1, 5.0, 1_000.0 / 60.0);
+        sampler.restart();
+
+        assert_eq!(sampler.samples, MIN_SAMPLES_PER_PASS);
+        assert!(sampler.smoothed_milliseconds.is_none());
+    }
+
+    #[test]
+    fn adaptive_sampler_respects_a_high_refresh_budget() {
+        let mut sampler = AdaptiveSampler::new();
+        for _ in 0..8 {
+            sampler.observe(1, 5.0, 1_000.0 / 165.0);
+        }
+        assert_eq!(sampler.samples, 1);
+    }
+
+    #[test]
+    fn adaptive_sampler_reduces_four_spp_at_165_hz_to_the_floor() {
+        let mut sampler = AdaptiveSampler {
+            samples: 4,
+            smoothed_milliseconds: None,
+            consecutive_fast_passes: 0,
+        };
+        sampler.observe(4, 30.0, 1_000.0 / 165.0);
+        assert_eq!(sampler.samples, 1);
+    }
+
+    #[test]
+    fn refresh_rate_estimator_recognizes_165_hz_vsync() {
+        let mut estimator = RefreshRateEstimator::new();
+        for _ in 0..REFRESH_TIMING_WARMUP_SAMPLES {
+            estimator.observe(1.0 / 165.0);
+        }
+        assert!((estimator.hertz - 165.0).abs() < 0.1);
+        assert!((estimator.frame_budget_milliseconds() - 6.060_606).abs() < 0.01);
+    }
+
+    #[test]
+    fn slow_gpu_frames_do_not_lower_the_calibrated_refresh_rate() {
+        let mut estimator = RefreshRateEstimator::new();
+        for _ in 0..REFRESH_TIMING_SAMPLE_COUNT {
+            estimator.observe(1.0 / 165.0);
+        }
+        for _ in 0..REFRESH_TIMING_SAMPLE_COUNT {
+            estimator.observe(1.0 / 30.0);
+        }
+        assert!((estimator.hertz - 165.0).abs() < 0.1);
     }
 }

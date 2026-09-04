@@ -47,7 +47,11 @@ cargo run --release
 ```
 
 Click a piece and then a highlighted destination to move. Drag the render to orbit, use the wheel
-to zoom, and use the control panel to edit the light/dark pieces and board independently.
+to zoom, and use the control panel to edit the light/dark pieces and board independently. The
+interactive renderer automatically selects 1–16 rays per pixel to keep each full-resolution pass
+near the display's measured refresh interval. Ray tracing and readback run on a background thread,
+so a long pass does not block input or the vsynced UI loop. Passes are accumulated in linear HDR
+space and tone-mapped only for display; adaptive sampling can be disabled in the Optics controls.
 
 For an offscreen render that does not create a window:
 
@@ -58,7 +62,7 @@ cargo run --release -- --headless renders/opening.png \
 
 Headless renders accept the same presets used by the UI, for example
 `--light-style glass --dark-style ceramic --board-style metal`. `--passes` averages independent
-progressive passes for low-noise output.
+progressive passes in linear HDR space for low-noise output.
 
 Render an arbitrary position:
 
@@ -77,6 +81,7 @@ Run the CPU-side tests with `cargo test`.
 - `New game`: restore the standard position
 - `Undo`: restore the previous position
 - `Save PNG`: save the current frame in `renders/`
+- Adaptive sampling: target the display refresh interval with 1–16 full-resolution rays per pixel
 - Progressive accumulation: up to 65,536 passes, or continuous until paused
 - FEN field: paste a position and press Enter or `Load FEN`
 
@@ -88,5 +93,6 @@ Run the CPU-side tests with `cargo test`.
 - `src/scene.rs`: licensed-piece integration, procedural fallback meshes, and board scene
 - `src/material.rs`: editable GPU material and camera settings
 - `src/chess_game.rs`: legal move interaction backed by the `chess` move generator
-- `src/app.rs`: wgpu-backed egui application
+- `src/app.rs`: wgpu-backed egui application and refresh-rate sampling policy
+- `src/render_worker.rs`: coalescing background thread for Vulkan rendering and readback
 - `shaders/`: GLSL ray generation, closest-hit, and miss stages compiled to SPIR-V at build time

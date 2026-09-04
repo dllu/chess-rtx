@@ -57,7 +57,7 @@ struct Args {
     #[arg(long, default_value_t = 640)]
     height: u32,
 
-    /// Rays per pixel (1-16).
+    /// Rays per pixel for each headless pass or for manual interactive sampling (1-16).
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=16))]
     samples: u32,
 
@@ -115,25 +115,12 @@ fn main() -> Result<()> {
         let geometry = scene.geometry_label();
         let mut renderer = RayTracer::new(args.width, args.height, &scene)
             .context("failed to initialize the Vulkan ray-tracing renderer")?;
-        let first_pass = renderer
-            .render(&settings)
-            .context("hardware ray-traced frame failed")?;
-        let mut accumulated = first_pass
-            .iter()
-            .map(|sample| u64::from(*sample))
-            .collect::<Vec<_>>();
-        for pass in 1..args.passes {
-            let pass_pixels = renderer
+        let mut pixels = Vec::new();
+        for pass in 0..args.passes {
+            pixels = renderer
                 .render(&settings)
                 .with_context(|| format!("hardware ray-traced pass {} failed", pass + 1))?;
-            for (sum, sample) in accumulated.iter_mut().zip(pass_pixels) {
-                *sum = sum.saturating_add(u64::from(sample));
-            }
         }
-        let pixels = accumulated
-            .into_iter()
-            .map(|sum| (sum / u64::from(args.passes)) as u8)
-            .collect::<Vec<_>>();
         image::save_buffer(
             &path,
             &pixels,
@@ -146,7 +133,7 @@ fn main() -> Result<()> {
             "Rendered {}x{} with VK_KHR_ray_tracing_pipeline ({geometry}, {} rays/pixel) on {} -> {}",
             args.width,
             args.height,
-            u64::from(args.samples) * u64::from(args.passes),
+            renderer.accumulated_samples_per_pixel(),
             renderer.device_name(),
             path.display()
         );
@@ -160,6 +147,7 @@ fn main() -> Result<()> {
     let native_options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         hardware_acceleration: eframe::HardwareAcceleration::Required,
+        vsync: true,
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Chess RTX")
             .with_inner_size([1440.0, 900.0])

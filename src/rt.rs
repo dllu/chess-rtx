@@ -17,6 +17,7 @@ use crate::{
 };
 
 const RAY_GROUP_COUNT: u32 = 4;
+const DISPLAY_PIXEL_SIZE: u64 = size_of::<[u8; 4]>() as u64;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -33,6 +34,8 @@ struct FrameUniform {
     effects: [f32; 4],
     /// width, height, frame index, board style
     resolution: [f32; 4],
+    /// previously accumulated samples, reserved
+    accumulation: [f32; 4],
 }
 
 struct VulkanContext {
@@ -283,6 +286,7 @@ pub struct RayTracer {
     blas: AccelerationResource,
     tlas: AccelerationResource,
     output: ImageResource,
+    accumulation: ImageResource,
     descriptor_pool: vk::DescriptorPool,
     descriptor_set_layout: vk::DescriptorSetLayout,
     descriptor_set: vk::DescriptorSet,
@@ -292,6 +296,7 @@ pub struct RayTracer {
     width: u32,
     height: u32,
     frame_index: u32,
+    accumulated_samples_per_pixel: u64,
     pipeline_recursion_depth: u32,
 }
 
@@ -364,7 +369,7 @@ impl RayTracer {
         )?;
         let readback_buffer = create_buffer(
             &context,
-            u64::from(width) * u64::from(height) * 4,
+            output_byte_len(width, height)?,
             vk::BufferUsageFlags::TRANSFER_DST,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )?;
@@ -378,7 +383,22 @@ impl RayTracer {
             scene.indices.len() as u32,
         )?;
         let tlas = build_tlas(&context, command_pool, blas)?;
-        let output = create_output_image(&context, command_pool, width, height)?;
+        let output = create_storage_image(
+            &context,
+            command_pool,
+            width,
+            height,
+            vk::Format::R8G8B8A8_UNORM,
+            true,
+        )?;
+        let accumulation = create_storage_image(
+            &context,
+            command_pool,
+            width,
+            height,
+            vk::Format::R32G32B32A32_SFLOAT,
+            false,
+        )?;
 
         let descriptor_pool_sizes = [
             vk::DescriptorPoolSize {
@@ -387,7 +407,7 @@ impl RayTracer {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_IMAGE,
-                descriptor_count: 1,
+                descriptor_count: 2,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::UNIFORM_BUFFER,
@@ -426,6 +446,7 @@ impl RayTracer {
             descriptor_binding(4, vk::DescriptorType::STORAGE_BUFFER, closest_hit),
             descriptor_binding(5, vk::DescriptorType::STORAGE_BUFFER, closest_hit),
             descriptor_binding(6, vk::DescriptorType::STORAGE_BUFFER, closest_hit),
+            descriptor_binding(7, vk::DescriptorType::STORAGE_IMAGE, raygen),
         ];
         let layout_info = vk::DescriptorSetLayoutCreateInfo {
             binding_count: bindings.len() as u32,
@@ -455,6 +476,7 @@ impl RayTracer {
             descriptor_set,
             tlas,
             output,
+            accumulation,
             uniform_buffer,
             vertex_buffer,
             index_buffer,
@@ -494,6 +516,7 @@ impl RayTracer {
             blas,
             tlas,
             output,
+            accumulation,
             descriptor_pool,
             descriptor_set_layout,
             descriptor_set,
@@ -503,6 +526,7 @@ impl RayTracer {
             width,
             height,
             frame_index: 0,
+            accumulated_samples_per_pixel: 0,
             pipeline_recursion_depth,
         })
     }
@@ -514,7 +538,7 @@ impl RayTracer {
     ///
     /// # Errors
     ///
-    /// Returns an error if the new output image or readback buffer cannot be allocated.
+    /// Returns an error if the new render images or readback buffer cannot be allocated.
     pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
         if width == 0 || height == 0 {
             bail!("render dimensions must be non-zero");
@@ -525,12 +549,18 @@ impl RayTracer {
 
         let new_readback = create_buffer(
             &self.context,
-            u64::from(width) * u64::from(height) * 4,
+            output_byte_len(width, height)?,
             vk::BufferUsageFlags::TRANSFER_DST,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )?;
-        let new_output = match create_output_image(&self.context, self.command_pool, width, height)
-        {
+        let new_output = match create_storage_image(
+            &self.context,
+            self.command_pool,
+            width,
+            height,
+            vk::Format::R8G8B8A8_UNORM,
+            true,
+        ) {
             Ok(output) => output,
             Err(error) => {
                 // SAFETY: this newly allocated buffer has never been submitted to the GPU.
@@ -538,12 +568,31 @@ impl RayTracer {
                 return Err(error);
             }
         };
+        let new_accumulation = match create_storage_image(
+            &self.context,
+            self.command_pool,
+            width,
+            height,
+            vk::Format::R32G32B32A32_SFLOAT,
+            false,
+        ) {
+            Ok(accumulation) => accumulation,
+            Err(error) => {
+                // SAFETY: these replacement resources have never been used for rendering.
+                unsafe {
+                    destroy_image(&self.context.device, new_output);
+                    destroy_buffer(&self.context.device, new_readback);
+                }
+                return Err(error);
+            }
+        };
 
         // Render submission is synchronous today, but explicitly waiting here also keeps this
         // method correct if submission becomes asynchronous later.
         if let Err(error) = unsafe { self.context.device.device_wait_idle() } {
-            // SAFETY: both replacement resources are unused and belong to this device.
+            // SAFETY: all replacement resources are unused and belong to this device.
             unsafe {
+                destroy_image(&self.context.device, new_accumulation);
                 destroy_image(&self.context.device, new_output);
                 destroy_buffer(&self.context.device, new_readback);
             }
@@ -555,6 +604,7 @@ impl RayTracer {
             self.descriptor_set,
             self.tlas,
             new_output,
+            new_accumulation,
             self.uniform_buffer,
             self.vertex_buffer,
             self.index_buffer,
@@ -562,26 +612,32 @@ impl RayTracer {
             self.material_buffer,
         );
         let old_output = std::mem::replace(&mut self.output, new_output);
+        let old_accumulation = std::mem::replace(&mut self.accumulation, new_accumulation);
         let old_readback = std::mem::replace(&mut self.readback_buffer, new_readback);
         self.width = width;
         self.height = height;
         self.frame_index = 0;
+        self.accumulated_samples_per_pixel = 0;
         log::info!("resized RTX output to {width}x{height}");
 
         // SAFETY: the device is idle and the descriptor now points at the replacement image.
         unsafe {
+            destroy_image(&self.context.device, old_accumulation);
             destroy_image(&self.context.device, old_output);
             destroy_buffer(&self.context.device, old_readback);
         }
         Ok(())
     }
 
-    /// Traces and reads back one RGBA8 frame with the supplied camera and materials.
+    /// Adds one pass to the linear HDR accumulation and reads back its tone-mapped RGBA8 image.
+    /// Call [`Self::reset_accumulation`] before rendering changed camera, material, or lighting
+    /// settings into an existing renderer.
     ///
     /// # Errors
     ///
     /// Returns an error if an upload, queue submission, ray dispatch, or readback fails.
     pub fn render(&mut self, settings: &RenderSettings) -> Result<Vec<u8>> {
+        let samples_per_pixel = settings.samples.clamp(1, 16);
         let (position, forward, right, up) = settings.camera_basis();
         let uniform = FrameUniform {
             camera_position: position.extend(1.0).to_array(),
@@ -592,7 +648,7 @@ impl RayTracer {
             render: [
                 settings.exposure,
                 settings.light_radius,
-                settings.samples.clamp(1, 16) as f32,
+                samples_per_pixel as f32,
                 settings
                     .max_bounces
                     .clamp(1, self.pipeline_recursion_depth - 2) as f32,
@@ -609,6 +665,7 @@ impl RayTracer {
                 self.frame_index as f32,
                 f32::from(settings.board_style == BoardStyle::BrushedMetal),
             ],
+            accumulation: [self.accumulated_samples_per_pixel as f32, 0.0, 0.0, 0.0],
         };
         upload(&self.context, self.uniform_buffer, 0, &[uniform])?;
         upload(
@@ -621,6 +678,27 @@ impl RayTracer {
         submit_immediate(&self.context, self.command_pool, |command_buffer| {
             // SAFETY: all bound objects are valid, compatible, and kept alive until queue idle.
             unsafe {
+                if self.accumulated_samples_per_pixel > 0 {
+                    let accumulation_dependency = vk::ImageMemoryBarrier {
+                        src_access_mask: vk::AccessFlags::SHADER_WRITE,
+                        dst_access_mask: vk::AccessFlags::SHADER_READ
+                            | vk::AccessFlags::SHADER_WRITE,
+                        old_layout: vk::ImageLayout::GENERAL,
+                        new_layout: vk::ImageLayout::GENERAL,
+                        image: self.accumulation.image,
+                        subresource_range: color_subresource_range(),
+                        ..Default::default()
+                    };
+                    self.context.device.cmd_pipeline_barrier(
+                        command_buffer,
+                        vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+                        vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[accumulation_dependency],
+                    );
+                }
                 self.context.device.cmd_bind_pipeline(
                     command_buffer,
                     vk::PipelineBindPoint::RAY_TRACING_KHR,
@@ -727,8 +805,12 @@ impl RayTracer {
                 );
             }
         })?;
+        self.accumulated_samples_per_pixel = self
+            .accumulated_samples_per_pixel
+            .saturating_add(u64::from(samples_per_pixel));
 
-        let byte_count = (u64::from(self.width) * u64::from(self.height) * 4) as usize;
+        let byte_count = usize::try_from(output_byte_len(self.width, self.height)?)
+            .context("render dimensions exceed host address space")?;
         // SAFETY: readback memory is HOST_VISIBLE, the queue is idle, and byte_count is in range.
         let mapped = unsafe {
             self.context.device.map_memory(
@@ -739,7 +821,7 @@ impl RayTracer {
             )
         }
         .context("could not map the rendered image")?;
-        // SAFETY: mapped points to at least byte_count initialized bytes after the copy.
+        // SAFETY: mapped points to byte_count initialized RGBA8 bytes after the copy.
         let pixels =
             unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), byte_count) }.to_vec();
         // SAFETY: mapped is the active mapping of this allocation.
@@ -750,6 +832,16 @@ impl RayTracer {
         };
         self.frame_index = self.frame_index.wrapping_add(1);
         Ok(pixels)
+    }
+
+    /// Discards the sample history on the next render without reallocating its image.
+    pub fn reset_accumulation(&mut self) {
+        self.accumulated_samples_per_pixel = 0;
+    }
+
+    #[must_use]
+    pub const fn accumulated_samples_per_pixel(&self) -> u64 {
+        self.accumulated_samples_per_pixel
     }
 
     #[must_use]
@@ -779,6 +871,7 @@ impl Drop for RayTracer {
             self.context
                 .device
                 .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+            destroy_image(&self.context.device, self.accumulation);
             destroy_image(&self.context.device, self.output);
             self.context
                 .acceleration_structure
@@ -808,6 +901,13 @@ impl Drop for RayTracer {
 
 fn byte_len<T>(slice: &[T]) -> u64 {
     std::mem::size_of_val(slice) as u64
+}
+
+fn output_byte_len(width: u32, height: u32) -> Result<u64> {
+    u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(DISPLAY_PIXEL_SIZE))
+        .context("display output size overflow")
 }
 
 fn descriptor_binding(
@@ -1209,15 +1309,17 @@ fn build_tlas(
     Ok(AccelerationResource { handle, storage })
 }
 
-fn create_output_image(
+fn create_storage_image(
     context: &VulkanContext,
     command_pool: vk::CommandPool,
     width: u32,
     height: u32,
+    format: vk::Format,
+    transfer_source: bool,
 ) -> Result<ImageResource> {
     let image_info = vk::ImageCreateInfo {
         image_type: vk::ImageType::TYPE_2D,
-        format: vk::Format::R8G8B8A8_UNORM,
+        format,
         extent: vk::Extent3D {
             width,
             height,
@@ -1227,14 +1329,19 @@ fn create_output_image(
         array_layers: 1,
         samples: vk::SampleCountFlags::TYPE_1,
         tiling: vk::ImageTiling::OPTIMAL,
-        usage: vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+        usage: vk::ImageUsageFlags::STORAGE
+            | if transfer_source {
+                vk::ImageUsageFlags::TRANSFER_SRC
+            } else {
+                vk::ImageUsageFlags::empty()
+            },
         sharing_mode: vk::SharingMode::EXCLUSIVE,
         initial_layout: vk::ImageLayout::UNDEFINED,
         ..Default::default()
     };
     // SAFETY: image_info is self-contained and valid.
     let image = unsafe { context.device.create_image(&image_info, None) }
-        .context("could not create the RTX output image")?;
+        .context("could not create an RTX storage image")?;
     // SAFETY: image belongs to the device.
     let requirements = unsafe { context.device.get_image_memory_requirements(image) };
     let memory_type = context.find_memory_type(
@@ -1248,20 +1355,20 @@ fn create_output_image(
     };
     // SAFETY: allocation parameters satisfy the image requirements.
     let memory = unsafe { context.device.allocate_memory(&allocation_info, None) }
-        .context("could not allocate the RTX output image")?;
+        .context("could not allocate an RTX storage image")?;
     // SAFETY: offset zero satisfies the returned alignment requirement.
     unsafe { context.device.bind_image_memory(image, memory, 0) }
-        .context("could not bind the RTX output image")?;
+        .context("could not bind an RTX storage image")?;
     let view_info = vk::ImageViewCreateInfo {
         image,
         view_type: vk::ImageViewType::TYPE_2D,
-        format: vk::Format::R8G8B8A8_UNORM,
+        format,
         subresource_range: color_subresource_range(),
         ..Default::default()
     };
     // SAFETY: view_info addresses the image's only color subresource.
     let view = unsafe { context.device.create_image_view(&view_info, None) }
-        .context("could not create the RTX output image view")?;
+        .context("could not create an RTX storage image view")?;
     submit_immediate(context, command_pool, |command_buffer| {
         let barrier = vk::ImageMemoryBarrier {
             src_access_mask: vk::AccessFlags::empty(),
@@ -1308,6 +1415,7 @@ fn update_descriptors(
     descriptor_set: vk::DescriptorSet,
     tlas: AccelerationResource,
     output: ImageResource,
+    accumulation: ImageResource,
     uniform: BufferResource,
     vertices: BufferResource,
     indices: BufferResource,
@@ -1320,8 +1428,13 @@ fn update_descriptors(
         p_acceleration_structures: acceleration_structures.as_ptr(),
         ..Default::default()
     };
-    let image_info = [vk::DescriptorImageInfo {
+    let output_info = [vk::DescriptorImageInfo {
         image_view: output.view,
+        image_layout: vk::ImageLayout::GENERAL,
+        ..Default::default()
+    }];
+    let accumulation_info = [vk::DescriptorImageInfo {
+        image_view: accumulation.view,
         image_layout: vk::ImageLayout::GENERAL,
         ..Default::default()
     }];
@@ -1339,7 +1452,7 @@ fn update_descriptors(
             descriptor_type: vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
             ..Default::default()
         },
-        image_descriptor(descriptor_set, 1, &image_info),
+        image_descriptor(descriptor_set, 1, &output_info),
         buffer_write(
             descriptor_set,
             2,
@@ -1370,6 +1483,7 @@ fn update_descriptors(
             vk::DescriptorType::STORAGE_BUFFER,
             &material_info,
         ),
+        image_descriptor(descriptor_set, 7, &accumulation_info),
     ];
     // SAFETY: descriptor resources and backing info arrays remain valid for this immediate call.
     unsafe { context.device.update_descriptor_sets(&writes, &[]) };

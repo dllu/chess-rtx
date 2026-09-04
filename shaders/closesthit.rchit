@@ -12,6 +12,7 @@ layout(std140, set = 0, binding = 2) uniform FrameUniform {
     vec4 render;
     vec4 effects;
     vec4 resolution;
+    vec4 accumulation;
 } frame;
 
 struct Vertex {
